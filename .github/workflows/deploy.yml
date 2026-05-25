@@ -1,0 +1,410 @@
+name: Deploy testweb6deploy
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    name: Provision EC2
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.server_ip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=us-east-1" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="public_key=${{ secrets.EC2_SSH_PUBLIC_KEY }}" \
+            -var="region=us-east-1"
+
+      - name: Get Server IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          SERVER_IP=$(terraform output -raw public_ip)
+          echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Configure and Deploy
+    runs-on: ubuntu-latest
+    needs: provision
+    env:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible
+        run: |
+          pip install ansible
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Wait for SSH to be available
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Waiting for SSH on $SERVER_IP..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ubuntu@$SERVER_IP "echo ok" 2>/dev/null; then
+              echo "SSH is ready."
+              break
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Write Ansible playbook
+        run: |
+          mkdir -p ansible
+          cat > ansible/playbook.yml << 'PLAYBOOK'
+          ---
+          - name: Deploy Node.js app
+            hosts: all
+            become: yes
+            vars:
+              app_dir: /opt/app
+              app_user: ubuntu
+              node_version: "20"
+
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
+
+              - name: Install required system packages
+                apt:
+                  name:
+                    - curl
+                    - git
+                    - nginx
+                    - build-essential
+                  state: present
+
+              - name: Install Node.js 20 via NodeSource
+                shell: |
+                  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+                  apt-get install -y nodejs
+                args:
+                  creates: /usr/bin/node
+
+              - name: Install PM2 globally
+                npm:
+                  name: pm2
+                  global: yes
+                  state: present
+
+              - name: Create app directory
+                file:
+                  path: "{{ app_dir }}"
+                  state: directory
+                  owner: "{{ app_user }}"
+                  group: "{{ app_user }}"
+                  mode: "0755"
+
+              - name: Install local DB if requested (postgres)
+                shell: |
+                  apt-get install -y postgresql postgresql-contrib
+                  PG_HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+                  if [ -n "$PG_HBA" ]; then
+                    sed -i 's/scram-sha-256/md5/g' "$PG_HBA"
+                    systemctl reload postgresql
+                  fi
+                  sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+                    sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+                  sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || \
+                    sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';"
+                  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+                when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+                become: yes
+
+              - name: Install local DB if requested (mysql)
+                shell: |
+                  apt-get install -y mysql-server
+                  systemctl enable mysql
+                  systemctl start mysql
+                  mysql -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+                  mysql -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password }}'; GRANT ALL ON {{ db_name }}.* TO '{{ db_username }}'@'localhost';"
+                when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
+                become: yes
+
+              - name: Install local DB if requested (mongodb)
+                shell: |
+                  curl -fsSL https://www.mongodb.org/static/pgp/server-6.0.asc | apt-key add -
+                  echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-6.0.list
+                  apt-get update
+                  apt-get install -y mongodb-org
+                  systemctl enable mongod
+                  systemctl start mongod
+                  sleep 5
+                  mongosh --eval 'db.getSiblingDB("{{ db_name }}").createCollection("init")'
+                when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+                become: yes
+
+              - name: Sync application code
+                synchronize:
+                  src: "{{ playbook_dir }}/../"
+                  dest: "{{ app_dir }}/"
+                  delete: yes
+                  recursive: yes
+                  rsync_opts:
+                    - "--exclude=.git"
+                    - "--exclude=node_modules"
+                    - "--exclude=.github"
+                    - "--exclude=terraform"
+                    - "--exclude=ansible"
+                delegate_to: localhost
+                become: no
+
+              - name: Set app directory ownership
+                file:
+                  path: "{{ app_dir }}"
+                  owner: "{{ app_user }}"
+                  group: "{{ app_user }}"
+                  recurse: yes
+
+              - name: Write .env file
+                shell: |
+                  printf '' > {{ app_dir }}/.env
+                  [ -n "{{ node_env_database_url | default('') }}" ] && echo "DATABASE_URL={{ node_env_database_url }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_mongo_uri | default('') }}" ] && echo "MONGO_URI={{ node_env_mongo_uri }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_host | default('') }}" ] && echo "DB_HOST={{ node_env_db_host }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_port | default('') }}" ] && echo "DB_PORT={{ node_env_db_port }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_name | default('') }}" ] && echo "DB_NAME={{ node_env_db_name }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_user | default('') }}" ] && echo "DB_USER={{ node_env_db_user }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_password | default('') }}" ] && echo "DB_PASSWORD={{ node_env_db_password }}" >> {{ app_dir }}/.env || true
+                  echo "PORT=3000" >> {{ app_dir }}/.env
+                  echo "HOST=0.0.0.0" >> {{ app_dir }}/.env
+                  chown {{ app_user }}:{{ app_user }} {{ app_dir }}/.env
+                  chmod 600 {{ app_dir }}/.env
+                become: yes
+
+              - name: Install Node.js dependencies
+                shell: |
+                  cd {{ app_dir }}
+                  npm install --production
+                become: yes
+                become_user: "{{ app_user }}"
+
+              - name: Run build if build script exists
+                shell: |
+                  cd {{ app_dir }}
+                  if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)" 2>/dev/null; then
+                    npm run build
+                  fi
+                become: yes
+                become_user: "{{ app_user }}"
+
+              - name: Stop existing PM2 app
+                shell: |
+                  pm2 delete app 2>/dev/null || true
+                become: yes
+                become_user: "{{ app_user }}"
+
+              - name: Start app with PM2
+                shell: |
+                  cd {{ app_dir }}
+                  set -a
+                  [ -f {{ app_dir }}/.env ] && . {{ app_dir }}/.env
+                  export PORT=${PORT:-3000}
+                  export HOST=${HOST:-0.0.0.0}
+                  set +a
+                  if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.start ? 0 : 1)" 2>/dev/null; then
+                    pm2 start npm --name app -- start --update-env
+                  elif [ -f {{ app_dir }}/server.js ]; then
+                    pm2 start {{ app_dir }}/server.js --name app --update-env
+                  elif [ -f {{ app_dir }}/index.js ]; then
+                    pm2 start {{ app_dir }}/index.js --name app --update-env
+                  elif [ -f {{ app_dir }}/app.js ]; then
+                    pm2 start {{ app_dir }}/app.js --name app --update-env
+                  else
+                    echo "ERROR: No valid entrypoint found"
+                    exit 1
+                  fi
+                become: yes
+                become_user: "{{ app_user }}"
+
+              - name: Save PM2 process list
+                shell: pm2 save
+                become: yes
+                become_user: "{{ app_user }}"
+
+              - name: Setup PM2 systemd startup
+                shell: |
+                  env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
+                args:
+                  creates: /etc/systemd/system/pm2-ubuntu.service
+                become: yes
+
+              - name: Wait for app to be ready
+                wait_for:
+                  host: 127.0.0.1
+                  port: 3000
+                  timeout: 120
+                  delay: 10
+                ignore_errors: yes
+                register: app_wait
+
+              - name: Print PM2 logs if app failed to start
+                shell: pm2 logs app --lines 50 --nostream
+                become: yes
+                become_user: "{{ app_user }}"
+                when: app_wait.failed is defined and app_wait.failed
+
+              - name: Fail if app did not start
+                fail:
+                  msg: "Application failed to start on port 3000. Check PM2 logs above."
+                when: app_wait.failed is defined and app_wait.failed
+
+              - name: Configure Nginx
+                copy:
+                  dest: /etc/nginx/sites-available/app
+                  content: |
+                    server {
+                        listen 80;
+                        server_name _;
+
+                        location / {
+                            proxy_pass http://127.0.0.1:3000;
+                            proxy_http_version 1.1;
+                            proxy_set_header Upgrade $http_upgrade;
+                            proxy_set_header Connection 'upgrade';
+                            proxy_set_header Host $host;
+                            proxy_set_header X-Real-IP $remote_addr;
+                            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                            proxy_set_header X-Forwarded-Proto $scheme;
+                            proxy_cache_bypass $http_upgrade;
+                        }
+                    }
+                become: yes
+
+              - name: Enable Nginx site
+                file:
+                  src: /etc/nginx/sites-available/app
+                  dest: /etc/nginx/sites-enabled/app
+                  state: link
+                become: yes
+
+              - name: Remove default Nginx site
+                file:
+                  path: /etc/nginx/sites-enabled/default
+                  state: absent
+                become: yes
+
+              - name: Test Nginx configuration
+                shell: nginx -t
+                become: yes
+
+              - name: Restart Nginx
+                systemd:
+                  name: nginx
+                  state: restarted
+                  enabled: yes
+                become: yes
+
+              - name: Print server IP
+                debug:
+                  msg: "server_ip={{ ansible_host }}"
+          PLAYBOOK
+
+      - name: Run Ansible playbook
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          ansible-playbook ansible/playbook.yml \
+            -i "$SERVER_IP," \
+            -u ubuntu \
+            --private-key /tmp/deploy_key \
+            -e node_env_database_url='${{ secrets.DATABASE_URL }}' \
+            -e node_env_mongo_uri='${{ secrets.MONGO_URI }}' \
+            -e node_env_db_host='${{ secrets.DB_HOST }}' \
+            -e node_env_db_port='${{ secrets.DB_PORT }}' \
+            -e node_env_db_name='${{ secrets.DB_NAME }}' \
+            -e node_env_db_user='${{ secrets.DB_USER }}' \
+            -e node_env_db_password='${{ secrets.DB_PASSWORD }}' \
+            -e install_db='${{ secrets.INSTALL_DB_ON_EC2 }}' \
+            -e db_type='${{ secrets.DB_TYPE }}' \
+            -e db_name='${{ secrets.DB_NAME }}' \
+            -e db_username='${{ secrets.DB_USERNAME }}' \
+            -e db_password='${{ secrets.DB_PASSWORD }}'
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Check health endpoint
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Verifying deployment at http://$SERVER_IP/health"
+          for i in $(seq 1 12); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$SERVER_IP/health" || echo "000")
+            echo "Attempt $i: HTTP $HTTP_STATUS"
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed after all attempts"
+          exit 1
+
+  notify:
+    name: Notify Deployment Result
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+    steps:
+      - name: Deployment success
+        if: needs.verify.result == 'success'
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Deployment succeeded!"
+          echo "Application is live at: http://$SERVER_IP"
+          echo "Health endpoint: http://$SERVER_IP/health"
+
+      - name: Deployment failed
+        if: needs.verify.result != 'success'
+        run: |
+          echo "Deployment failed or verification did not pass."
+          exit 1
